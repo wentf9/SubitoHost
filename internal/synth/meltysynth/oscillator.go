@@ -50,10 +50,13 @@ func (o *oscillator) start(data []int16, loopMode int32, sampleRate int32, start
 	o.pitchChangeScale = float32(0.01) * float32(scaleTuning)
 	o.sampleRateRatio = float32(sampleRate) / float32(o.synthesizer.SampleRate)
 
-	if loopMode == loop_NoLoop {
+	switch loopMode {
+	case loop_NoLoop:
 		o.looping = false
-	} else {
+	case loop_Continuous, loop_LoopUntilNoteOff:
 		o.looping = true
+	default:
+		o.looping = false
 	}
 
 	o.position_fp = int64(start) << fracBits
