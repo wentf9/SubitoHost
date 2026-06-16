@@ -1,0 +1,53 @@
+{
+  "setlist_id": "example_gig",
+  "name": "Example Gig",
+  "profiles": [
+    {
+      "profile_id": "p01_opening",
+      "name": "Opening - Grand Piano",
+      "soundfont_path": "/path/to/Yamaha_C5.sf2",
+      "programs": [
+        {"channel": 0, "bank": 0, "program": 0}
+      ],
+      "rules": [
+        {
+          "rule_id": "r1",
+          "type": "velocity_curve",
+          "range": ["C-1", "C8"],
+          "curve": "exponential",
+          "target_channel": 0
+        }
+      ],
+      "next_profile_trigger": {"type": "cc", "cc_number": 66, "cc_value_min": 64}
+    },
+    {
+      "profile_id": "p02_ballad",
+      "name": "Ballad - Bass & Rhodes",
+      "soundfont_path": "/path/to/Rhodes_Mark2.sf2",
+      "programs": [
+        {"channel": 0, "bank": 0, "program": 4},
+        {"channel": 1, "bank": 0, "program": 32}
+      ],
+      "rules": [
+        {"rule_id": "r1", "type": "key_split", "range": ["C-1", "B2"], "target_channel": 1},
+        {"rule_id": "r2", "type": "transpose", "range": ["C-1", "B2"], "value": 12, "target_channel": 1},
+        {"rule_id": "r3", "type": "velocity_curve", "range": ["C3", "C8"], "curve": "logarithmic", "target_channel": 0}
+      ],
+      "next_profile_trigger": {"type": "cc", "cc_number": 66, "cc_value_min": 64}
+    },
+    {
+      "profile_id": "p03_finale",
+      "name": "Finale - Organ & Chord Pad",
+      "soundfont_path": "/path/to/Organ_B3.sf2",
+      "programs": [
+        {"channel": 0, "bank": 0, "program": 16},
+        {"channel": 1, "bank": 0, "program": 48}
+      ],
+      "rules": [
+        {"rule_id": "r1", "type": "key_split", "range": ["C-1", "B3"], "target_channel": 1},
+        {"rule_id": "r2", "type": "chord_expand", "range": ["C-1", "B3"], "target_channel": 1, "intervals": [0, 7, 12]}
+      ],
+      "next_profile_trigger": {"type": "cc", "cc_number": 66, "cc_value_min": 64}
+    }
+  ]
+}

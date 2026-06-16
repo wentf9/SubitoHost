@@ -1,0 +1,21 @@
+{
+  "listen_addr": "127.0.0.1:3301",
+  "audio": {
+    "backend": "alsa",
+    "sample_rate": 48000,
+    "buffer_size": 128,
+    "periods": 2
+  },
+  "midi": {
+    "auto_connect": true,
+    "device_name_pattern": "YAMAHA"
+  },
+  "recovery": {
+    "state_file": "~/.config/subitohost/state.json",
+    "auto_resume": true
+  },
+  "recording": {
+    "output_dir": "~/recordings",
+    "trigger_cc": 0
+  }
+}
