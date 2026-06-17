@@ -251,7 +251,7 @@ func (s *Synthesizer) NoteOn(channel int32, key int32, velocity int32) {
 	}
 
 	presetCount := len(preset.Regions)
-	for i := 0; i < presetCount; i++ {
+	for i := range presetCount {
 		presetRegion := preset.Regions[i]
 		if presetRegion.contains(key, velocity) {
 			instrumentCount := len(presetRegion.Instrument.Regions)
@@ -298,7 +298,7 @@ func (s *Synthesizer) NoteOffAllChannel(channel int32, immediate bool) {
 
 func (s *Synthesizer) ResetAllControllers() {
 	channelCount := len(s.channels)
-	for i := 0; i < channelCount; i++ {
+	for i := range channelCount {
 		s.channels[i].resetAllControllers()
 	}
 }
@@ -315,7 +315,7 @@ func (s *Synthesizer) Reset() {
 	s.voices.clear()
 
 	channelCount := len(s.channels)
-	for i := 0; i < channelCount; i++ {
+	for i := range channelCount {
 		s.channels[i].reset()
 	}
 
@@ -340,7 +340,7 @@ func (s *Synthesizer) Render(left []float32, right []float32) {
 		dstRem := int32(length - wrote)
 		rem := int32(math.Min(float64(srcRem), float64(dstRem)))
 
-		for i := int32(0); i < rem; i++ {
+		for i := range rem {
 			left[wrote+i] = s.blockLeft[s.blockRead+i]
 			right[wrote+i] = s.blockRight[s.blockRead+i]
 		}
@@ -356,12 +356,12 @@ func (s *Synthesizer) renderBlock() {
 
 	s.voices.process()
 
-	for i := 0; i < blockSize; i++ {
+	for i := range blockSize {
 		s.blockLeft[i] = 0
 		s.blockRight[i] = 0
 	}
 
-	for i := 0; i < activeVoiceCount; i++ {
+	for i := range activeVoiceCount {
 		voice := s.voices.voices[i]
 		previousGainLeft := s.MasterVolume * voice.previousMixGainLeft
 		currentGainLeft := s.MasterVolume * voice.currentMixGainLeft
@@ -372,13 +372,13 @@ func (s *Synthesizer) renderBlock() {
 	}
 
 	if s.EnableReverbAndChorus {
-		for i := 0; i < blockSize; i++ {
+		for i := range blockSize {
 			s.chorusInputLeft[i] = 0
 		}
-		for i := 0; i < blockSize; i++ {
+		for i := range blockSize {
 			s.chorusInputRight[i] = 0
 		}
-		for i := 0; i < activeVoiceCount; i++ {
+		for i := range activeVoiceCount {
 			voice := s.voices.voices[i]
 			previousGainLeft := voice.previousChorusSend * voice.previousMixGainLeft
 			currentGainLeft := voice.currentChorusSend * voice.currentMixGainLeft
@@ -391,10 +391,10 @@ func (s *Synthesizer) renderBlock() {
 		arrayMultiplyAdd(s.MasterVolume, s.chorusOutputLeft, s.blockLeft)
 		arrayMultiplyAdd(s.MasterVolume, s.chorusOutputRight, s.blockRight)
 
-		for i := 0; i < blockSize; i++ {
+		for i := range blockSize {
 			s.reverbInput[i] = 0
 		}
-		for i := 0; i < activeVoiceCount; i++ {
+		for i := range activeVoiceCount {
 			voice := s.voices.voices[i]
 			previousGain := s.reverb.getInputGain() * voice.previousReverbSend * (voice.previousMixGainLeft + voice.previousMixGainRight)
 			currentGain := s.reverb.getInputGain() * voice.currentReverbSend * (voice.currentMixGainLeft + voice.currentMixGainRight)
@@ -411,7 +411,9 @@ func (s *Synthesizer) writeBlock(previousGain float32, currentGain float32, sour
 		return
 	}
 
-	if math.Abs(float64(currentGain-previousGain)) < 1.0e-3 {
+	// 将优化阈值从 1.0e-3 修改为 1.0e-5
+	// 这样可以确保极微弱的包络渐变也能被平滑过渡，而不是阶梯跳变
+	if math.Abs(float64(currentGain-previousGain)) < 1.0e-5 {
 		arrayMultiplyAdd(currentGain, source, destination)
 	} else {
 		step := s.inverseBlockSize * (currentGain - previousGain)
