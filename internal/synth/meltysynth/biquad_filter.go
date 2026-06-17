@@ -66,6 +66,11 @@ func (bf *biQuadFilter) process(block []float32) {
 			input := block[t]
 			output := bf.a0*input + bf.a1*bf.x1 + bf.a2*bf.x2 - bf.a3*bf.y1 - bf.a4*bf.y2
 
+			// Anti-denormal protection to prevent precision penalties and background wind-like noise.
+			if (math.Float32bits(output) & 0x7FFFFFFF) < 897988541 {
+				output = 0
+			}
+
 			bf.x2 = bf.x1
 			bf.x1 = input
 			bf.y2 = bf.y1

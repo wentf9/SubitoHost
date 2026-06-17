@@ -99,10 +99,31 @@ func (o *oscillator) fillBlock_NoLoop(block []float32, pitchRatio_fp int64) bool
 			return false
 		}
 
-		x1 := int64(o.data[index])
-		x2 := int64(o.data[index+1])
+		idx0 := index - 1
+		if idx0 < o.sampleStart {
+			idx0 = index
+		}
+		idx1 := index
+		idx2 := index + 1
+		if idx2 >= o.sampleEnd {
+			idx2 = index
+		}
+		idx3 := index + 2
+		if idx3 >= o.sampleEnd {
+			idx3 = idx2
+		}
+
+		x0 := float64(o.data[idx0])
+		x1 := float64(o.data[idx1])
+		x2 := float64(o.data[idx2])
+		x3 := float64(o.data[idx3])
+
 		a_fp := o.position_fp & (fracUnit - 1)
-		block[t] = fpToSample * float32((x1<<fracBits)+a_fp*(x2-x1))
+		tVal := float64(a_fp) / float64(fracUnit)
+
+		// Cubic Hermite Interpolation (Float64 Precision)
+		val := x1 + 0.5*tVal*(x2-x0+tVal*(2.0*x0-5.0*x1+4.0*x2-x3+tVal*(3.0*(x1-x2)+x3-x0)))
+		block[t] = float32(val * (1.0 / 32768.0))
 
 		o.position_fp += pitchRatio_fp
 	}
@@ -119,21 +140,37 @@ func (o *oscillator) fillBlock_Continuous(block []float32, pitchRatio_fp int64) 
 	loopLength_fp := int64(loopLength) << fracBits
 
 	for t := 0; t < blockLength; t++ {
-		if o.position_fp >= endLoop_fp {
+		for o.position_fp >= endLoop_fp {
 			o.position_fp -= loopLength_fp
 		}
 
 		index1 := int32(o.position_fp >> fracBits)
-		index2 := index1 + 1
 
-		if index2 >= o.endLoop {
-			index2 -= loopLength
+		idx0 := index1 - 1
+		if idx0 < o.startLoop {
+			idx0 += loopLength
+		}
+		idx1 := index1
+		idx2 := index1 + 1
+		if idx2 >= o.endLoop {
+			idx2 -= loopLength
+		}
+		idx3 := index1 + 2
+		if idx3 >= o.endLoop {
+			idx3 -= loopLength
 		}
 
-		x1 := int64(o.data[index1])
-		x2 := int64(o.data[index2])
+		x0 := float64(o.data[idx0])
+		x1 := float64(o.data[idx1])
+		x2 := float64(o.data[idx2])
+		x3 := float64(o.data[idx3])
+
 		a_fp := o.position_fp & (fracUnit - 1)
-		block[t] = fpToSample * float32((x1<<fracBits)+a_fp*(x2-x1))
+		tVal := float64(a_fp) / float64(fracUnit)
+
+		// Cubic Hermite Interpolation (Float64 Precision)
+		val := x1 + 0.5*tVal*(x2-x0+tVal*(2.0*x0-5.0*x1+4.0*x2-x3+tVal*(3.0*(x1-x2)+x3-x0)))
+		block[t] = float32(val * (1.0 / 32768.0))
 
 		o.position_fp += pitchRatio_fp
 	}

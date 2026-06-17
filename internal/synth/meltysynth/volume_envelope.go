@@ -27,8 +27,8 @@ func newVolumeEnvelope(s *Synthesizer) *volumeEnvelope {
 
 func (env *volumeEnvelope) start(delay float32, attack float32, hold float32, decay float32, sustain float32, release float32) {
 	env.attackSlope = 1 / float64(attack)
-	env.decaySlope = -9.226 / float64(decay)
-	env.releaseSlope = -9.226 / float64(release)
+	env.decaySlope = -6.907755 / float64(decay)
+	env.releaseSlope = -6.907755 / float64(release)
 
 	env.attackStartTime = float64(delay)
 	env.holdStartTime = env.attackStartTime + float64(attack)

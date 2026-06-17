@@ -3,6 +3,7 @@ package synth
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -25,8 +26,8 @@ func getOtoContext(sampleRate int) (*oto.Context, error) {
 		op := &oto.NewContextOptions{
 			SampleRate:   sampleRate,
 			ChannelCount: 2,
-			Format:       oto.FormatSignedInt16LE,
-			BufferSize:   20 * time.Millisecond,
+			Format:       oto.FormatFloat32LE,
+			BufferSize:   30 * time.Millisecond,
 		}
 		var ready chan struct{}
 		otoCtx, ready, err = oto.NewContext(op)
@@ -52,6 +53,12 @@ type Synth struct {
 	gain         float64
 	activePlayer *Player
 	isHeadless   bool
+
+	// DC blocker state variables
+	dcLeftX  float32
+	dcLeftY  float32
+	dcRightX float32
+	dcRightY float32
 }
 
 // New creates a Synth instance with the given audio configuration.
@@ -70,7 +77,7 @@ func New(cfg config.Audio) (*Synth, error) {
 
 	// The player reads from Synth itself, which implements io.Reader
 	s.player = ctx.NewPlayer(s)
-	s.player.SetBufferSize(2048)
+	s.player.SetBufferSize(8192)
 	s.player.Play()
 
 	return s, nil
@@ -90,8 +97,8 @@ func (s *Synth) Read(p []byte) (n int, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 1 frame = 2 channels * 2 bytes (16-bit PCM) = 4 bytes
-	frames := len(p) / 4
+	// 1 frame = 2 channels * 4 bytes (32-bit Float LE) = 8 bytes
+	frames := len(p) / 8
 	if frames == 0 {
 		return 0, nil
 	}
@@ -104,7 +111,11 @@ func (s *Synth) Read(p []byte) (n int, err error) {
 		for i := range p {
 			p[i] = 0
 		}
-		return frames * 4, nil
+		s.dcLeftX = 0
+		s.dcLeftY = 0
+		s.dcRightX = 0
+		s.dcRightY = 0
+		return frames * 8, nil
 	}
 
 	if s.activePlayer != nil && atomic.LoadInt32(&s.activePlayer.active) == 1 {
@@ -114,29 +125,44 @@ func (s *Synth) Read(p []byte) (n int, err error) {
 	}
 
 	for i := 0; i < frames; i++ {
-		lVal := leftBuf[i]
+		// DC Blocker filter (R = 0.999)
+		xL := leftBuf[i]
+		yL := xL - s.dcLeftX + 0.999*s.dcLeftY
+		s.dcLeftX = xL
+		s.dcLeftY = yL
+
+		xR := rightBuf[i]
+		yR := xR - s.dcRightX + 0.999*s.dcRightY
+		s.dcRightX = xR
+		s.dcRightY = yR
+
+		lVal := yL
 		if lVal > 1.0 {
 			lVal = 1.0
 		} else if lVal < -1.0 {
 			lVal = -1.0
 		}
-		rVal := rightBuf[i]
+		rVal := yR
 		if rVal > 1.0 {
 			rVal = 1.0
 		} else if rVal < -1.0 {
 			rVal = -1.0
 		}
 
-		lInt := int16(lVal * 32767.0)
-		rInt := int16(rVal * 32767.0)
+		lBits := math.Float32bits(lVal)
+		rBits := math.Float32bits(rVal)
 
-		p[i*4] = byte(lInt)
-		p[i*4+1] = byte(lInt >> 8)
-		p[i*4+2] = byte(rInt)
-		p[i*4+3] = byte(rInt >> 8)
+		p[i*8] = byte(lBits)
+		p[i*8+1] = byte(lBits >> 8)
+		p[i*8+2] = byte(lBits >> 16)
+		p[i*8+3] = byte(lBits >> 24)
+		p[i*8+4] = byte(rBits)
+		p[i*8+5] = byte(rBits >> 8)
+		p[i*8+6] = byte(rBits >> 16)
+		p[i*8+7] = byte(rBits >> 24)
 	}
 
-	return frames * 4, nil
+	return frames * 8, nil
 }
 
 // LoadSoundFont loads a .sf2 file into the synth.
@@ -237,6 +263,10 @@ func (s *Synth) AllNotesOff() {
 		return
 	}
 	s.syn.NoteOffAll(false)
+	s.dcLeftX = 0
+	s.dcLeftY = 0
+	s.dcRightX = 0
+	s.dcRightY = 0
 }
 
 // Close releases resources.
@@ -266,6 +296,10 @@ func (s *Synth) WriteS16(buf []int16) error {
 		for i := range buf {
 			buf[i] = 0
 		}
+		s.dcLeftX = 0
+		s.dcLeftY = 0
+		s.dcRightX = 0
+		s.dcRightY = 0
 		return nil
 	}
 
@@ -276,21 +310,44 @@ func (s *Synth) WriteS16(buf []int16) error {
 	}
 
 	for i := 0; i < frames; i++ {
-		lVal := leftBuf[i]
+		// DC Blocker filter (R = 0.999)
+		xL := leftBuf[i]
+		yL := xL - s.dcLeftX + 0.999*s.dcLeftY
+		s.dcLeftX = xL
+		s.dcLeftY = yL
+
+		xR := rightBuf[i]
+		yR := xR - s.dcRightX + 0.999*s.dcRightY
+		s.dcRightX = xR
+		s.dcRightY = yR
+
+		lVal := yL
 		if lVal > 1.0 {
 			lVal = 1.0
 		} else if lVal < -1.0 {
 			lVal = -1.0
 		}
-		rVal := rightBuf[i]
+		rVal := yR
 		if rVal > 1.0 {
 			rVal = 1.0
 		} else if rVal < -1.0 {
 			rVal = -1.0
 		}
 
-		buf[i*2] = int16(lVal * 32767.0)
-		buf[i*2+1] = int16(rVal * 32767.0)
+		var lInt, rInt int16
+		if lVal >= 0 {
+			lInt = int16(lVal*32767.0 + 0.5)
+		} else {
+			lInt = int16(lVal*32767.0 - 0.5)
+		}
+		if rVal >= 0 {
+			rInt = int16(rVal*32767.0 + 0.5)
+		} else {
+			rInt = int16(rVal*32767.0 - 0.5)
+		}
+
+		buf[i*2] = lInt
+		buf[i*2+1] = rInt
 	}
 
 	return nil

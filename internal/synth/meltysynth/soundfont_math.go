@@ -6,10 +6,10 @@ import (
 
 const (
 	halfPi     float32 = math.Pi / 2
-	nonAudible float32 = 1.0e-3
+	nonAudible float32 = 1.0e-5
 )
 
-var logNonAudible float32 = float32(math.Log(1.0e-3))
+var logNonAudible float32 = float32(math.Log(1.0e-5))
 
 func calcTimecentsToSeconds(x float32) float32 {
 	return float32(math.Pow(float64(2), (float64(1)/float64(1200))*float64(x)))
