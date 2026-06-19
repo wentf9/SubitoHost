@@ -9,15 +9,24 @@ var resonancePeakOffset = float32(1 - 1/math.Sqrt(2))
 type biQuadFilter struct {
 	synthesizer *Synthesizer
 	active      bool
-	a0          float64
-	a1          float64
-	a2          float64
-	a3          float64
-	a4          float64
-	x1          float64
-	x2          float64
-	y1          float64
-	y2          float64
+	initialized bool // 用于判断是否是首次设置参数
+
+	a0 float64 // 目标系数 (Target)
+	a1 float64
+	a2 float64
+	a3 float64
+	a4 float64
+
+	cA0 float64 // 当前正在平滑过渡的系数 (Current)
+	cA1 float64
+	cA2 float64
+	cA3 float64
+	cA4 float64
+
+	x1 float64
+	x2 float64
+	y1 float64
+	y2 float64
 }
 
 func newBiQuadFilter(s *Synthesizer) *biQuadFilter {
@@ -31,6 +40,7 @@ func (bf *biQuadFilter) clearBuffer() {
 	bf.x2 = 0
 	bf.y1 = 0
 	bf.y2 = 0
+	bf.initialized = false // 重置初始化状态
 }
 
 func (bf *biQuadFilter) setLowPassFilter(cutoffFrequency float32, resonance float32) {
@@ -62,16 +72,32 @@ func (bf *biQuadFilter) process(block []float32) {
 	blockLength := len(block)
 
 	if bf.active {
+		// 计算当前音频块内，每个样本所需要平滑递增的系数步长
+		invBlock := 1.0 / float64(blockLength)
+		stepA0 := (bf.a0 - bf.cA0) * invBlock
+		stepA1 := (bf.a1 - bf.cA1) * invBlock
+		stepA2 := (bf.a2 - bf.cA2) * invBlock
+		stepA3 := (bf.a3 - bf.cA3) * invBlock
+		stepA4 := (bf.a4 - bf.cA4) * invBlock
+
 		for t := range blockLength {
+			// 每处理一个声音样本，滤波器系数就非常平滑地移动一点点
+			bf.cA0 += stepA0
+			bf.cA1 += stepA1
+			bf.cA2 += stepA2
+			bf.cA3 += stepA3
+			bf.cA4 += stepA4
+
 			// 将输入提升为双精度参与高精度运算
 			input := float64(block[t])
-			output := bf.a0*input + bf.a1*bf.x1 + bf.a2*bf.x2 - bf.a3*bf.y1 - bf.a4*bf.y2
+
+			// 使用动态渐变的系数 (cA) 而不是固定系数进行滤波
+			output := bf.cA0*input + bf.cA1*bf.x1 + bf.cA2*bf.x2 - bf.cA3*bf.y1 - bf.cA4*bf.y2
 
 			// 转换为单精度用于验证和输出
 			out32 := float32(output)
-
 			// 将 897988541 (1.0e-6) 替换为 8388608 (1.175e-38)
-			// 这既能阻挡真正的非正规数引发的 CPU 掉速，又能消除音频过零时的交越失真
+			// 防止极小数导致 CPU 掉速与交越失真的反常数保护
 			if (math.Float32bits(out32) & 0x7FFFFFFF) < 8388608 {
 				out32 = 0
 				output = 0 // 同步清零内部的 float64 状态，彻底切断反馈底噪
@@ -85,6 +111,14 @@ func (bf *biQuadFilter) process(block []float32) {
 			// 写回音频块
 			block[t] = out32
 		}
+
+		// 块处理结束时，强制对齐到最终目标值，消除由于步长累加可能造成的微小浮点误差
+		bf.cA0 = bf.a0
+		bf.cA1 = bf.a1
+		bf.cA2 = bf.a2
+		bf.cA3 = bf.a3
+		bf.cA4 = bf.a4
+
 	} else {
 		// 非活跃状态下，也要以高精度保存最后两个样本
 		bf.x2 = float64(block[blockLength-2])
@@ -100,4 +134,14 @@ func (bf *biQuadFilter) setCoefficients(a0 float64, a1 float64, a2 float64, b0 f
 	bf.a2 = b2 / a0
 	bf.a3 = a1 / a0
 	bf.a4 = a2 / a0
+
+	// 初次发声时直接对齐，不进行渐变
+	if !bf.initialized {
+		bf.cA0 = bf.a0
+		bf.cA1 = bf.a1
+		bf.cA2 = bf.a2
+		bf.cA3 = bf.a3
+		bf.cA4 = bf.a4
+		bf.initialized = true
+	}
 }
