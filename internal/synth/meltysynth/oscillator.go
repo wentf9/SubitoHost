@@ -91,8 +91,17 @@ func (o *oscillator) fillBlock_NoLoop(block []float32, pitchRatio_fp int64) bool
 		index := int32(o.position_fp >> fracBits)
 		if index >= o.sampleEnd {
 			if t > 0 {
-				for i := t; i < blockLength; i++ {
-					block[i] = 0
+				// Linear fade-out from the last valid sample to 0.
+				// This prevents the hard step discontinuity that causes click noise
+				// when the sample end is not at a zero-crossing point.
+				lastSample := block[t-1]
+				remaining := blockLength - t
+				for i := 0; i < remaining; i++ {
+					fadeGain := float32(1.0 - float64(i+1)/float64(remaining))
+					if fadeGain < 0 {
+						fadeGain = 0
+					}
+					block[t+i] = lastSample * fadeGain
 				}
 				return true
 			}

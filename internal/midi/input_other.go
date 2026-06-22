@@ -5,6 +5,7 @@ package midi
 
 import (
 	"errors"
+	"time"
 )
 
 // Input is a dummy implementation for non-Linux platforms.
@@ -18,6 +19,11 @@ func ListDevices() ([]DeviceInfo, error) {
 // OpenInput is a dummy implementation.
 func OpenInput(deviceID int) (*Input, error) {
 	return nil, errors.New("MIDI input is only supported on Linux in this implementation")
+}
+
+// WaitEvent is a dummy implementation.
+func (in *Input) WaitEvent(timeout time.Duration) bool {
+	return false
 }
 
 // Poll is a dummy implementation.

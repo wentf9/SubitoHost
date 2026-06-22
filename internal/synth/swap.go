@@ -52,12 +52,20 @@ func (m *SwapManager) SwapTo(profile *setlist.Profile) error {
 		newSynth.ProgramChange(p.Channel, p.Bank, p.Program)
 	}
 
-	old := m.Active.Swap(newSynth)
+	old := m.Active.Load()
 	if old != nil {
-		old.AllNotesOff()
-		// Delay close to let current audio buffer finish rendering
+		// Mute old synth and drain its event queue to prevent overlapping audio
+		old.DrainAndMute()
+		// Wait for one oto buffer cycle (~21ms) to let ALSA drain old data
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	m.Active.Store(newSynth)
+
+	if old != nil {
+		// Close old player now that its output is muted and drained
 		go func() {
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(50 * time.Millisecond)
 			old.Close()
 			log.Printf("closed old synth after swap to %q", profile.Name)
 		}()

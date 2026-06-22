@@ -6,6 +6,7 @@ const (
 	voice_Playing          int32 = 0
 	voice_ReleaseRequested int32 = 1
 	voice_Released         int32 = 2
+	voice_FadingOut        int32 = 3 // stolen voice, doing a 1-block gain ramp to 0
 )
 
 type voice struct {
@@ -143,6 +144,28 @@ func (v *voice) kill() {
 }
 
 func (v *voice) process() bool {
+	// Handle stolen voice fade-out: ramp gain to 0 in one block, then recycle.
+	// The oscillator still renders to provide source material for the gain ramp.
+	if v.voiceState == voice_FadingOut {
+		if v.voiceLength > 0 {
+			// Second block after steal: gain already ramped to 0, recycle now
+			v.noteGain = 0
+			return false
+		}
+		v.previousMixGainLeft = v.currentMixGainLeft
+		v.previousMixGainRight = v.currentMixGainRight
+		v.previousReverbSend = v.currentReverbSend
+		v.previousChorusSend = v.currentChorusSend
+		v.currentMixGainLeft = 0
+		v.currentMixGainRight = 0
+		v.currentReverbSend = 0
+		v.currentChorusSend = 0
+		// Render oscillator at current pitch to provide fade-out source signal
+		v.oscillator.process(v.block, float32(v.key))
+		v.voiceLength += v.synthesizer.BlockSize
+		return true
+	}
+
 	if v.noteGain < nonAudible {
 		return false
 	}

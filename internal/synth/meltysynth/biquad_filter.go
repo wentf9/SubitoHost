@@ -96,11 +96,11 @@ func (bf *biQuadFilter) process(block []float32) {
 
 			// 转换为单精度用于验证和输出
 			out32 := float32(output)
-			// 将 897988541 (1.0e-6) 替换为 8388608 (1.175e-38)
-			// 防止极小数导致 CPU 掉速与交越失真的反常数保护
+			// Denormal protection: flush float32 output to 0 to avoid CPU
+			// performance degradation, but preserve the float64 internal state
+			// (output -> y1) so the feedback loop decays naturally.
 			if (math.Float32bits(out32) & 0x7FFFFFFF) < 8388608 {
 				out32 = 0
-				output = 0 // 同步清零内部的 float64 状态，彻底切断反馈底噪
 			}
 
 			bf.x2 = bf.x1
@@ -112,12 +112,9 @@ func (bf *biQuadFilter) process(block []float32) {
 			block[t] = out32
 		}
 
-		// 块处理结束时，强制对齐到最终目标值，消除由于步长累加可能造成的微小浮点误差
-		bf.cA0 = bf.a0
-		bf.cA1 = bf.a1
-		bf.cA2 = bf.a2
-		bf.cA3 = bf.a3
-		bf.cA4 = bf.a4
+		// Do NOT force-align cA to target at block end.
+		// Keeping the residual allows smooth continuation when cutoff changes
+		// mid-block via CC; the next block continues interpolating from cA.
 
 	} else {
 		// 非活跃状态下，也要以高精度保存最后两个样本

@@ -5,13 +5,24 @@ import "math"
 type voiceCollection struct {
 	synthesizer      *Synthesizer
 	voices           []*voice
-	activeVoiceCount int32
+	activeVoiceCount int32 // number of active voices (including fading out)
+	maxActive        int32 // max active voices excluding fade pool
 }
 
 func newVoiceCollection(s *Synthesizer, maxActiveVoiceCount int32) *voiceCollection {
+	// Allocate extra slots for the fade pool: when a voice is stolen, it
+	// continues to render one more block while fading out. The new voice
+	// uses a fade pool slot so it can start immediately.
+	fadePoolSize := maxActiveVoiceCount / 4
+	if fadePoolSize < 8 {
+		fadePoolSize = 8
+	}
+	totalSlots := maxActiveVoiceCount + fadePoolSize
+
 	result := &voiceCollection{
 		synthesizer: s,
-		voices:      make([]*voice, maxActiveVoiceCount),
+		voices:      make([]*voice, totalSlots),
+		maxActive:   maxActiveVoiceCount,
 	}
 	for i := 0; i < len(result.voices); i++ {
 		result.voices[i] = newVoice(s)
@@ -34,19 +45,48 @@ func (vc *voiceCollection) requestNew(region *InstrumentRegion, channel int32) *
 		}
 	}
 
-	// If the number of active voices is less than the limit, use a free one.
-	if int(vc.activeVoiceCount) < len(vc.voices) {
+	// If we haven't reached the max active limit, use a free slot.
+	if vc.activeVoiceCount < vc.maxActive {
 		free := vc.voices[vc.activeVoiceCount]
 		vc.activeVoiceCount++
 		return free
 	}
 
-	// Too many active voices...
-	// Find one which has the lowest priority.
+	// At max active voices. Try to use a fade pool slot if available.
+	if int(vc.activeVoiceCount) < len(vc.voices) {
+		// Steal the lowest priority non-fading voice.
+		candidate := vc.findStealCandidate()
+		if candidate != nil {
+			candidate.voiceState = voice_FadingOut
+			candidate.voiceLength = 0 // reset so FadingOut logic knows it's the first block
+		}
+		// Use a fade pool slot for the new voice
+		free := vc.voices[vc.activeVoiceCount]
+		vc.activeVoiceCount++
+		return free
+	}
+
+	// All slots (including fade pool) are full. Fall back to direct reuse
+	// of the lowest priority voice without fade-out.
+	candidate := vc.findStealCandidate()
+	if candidate != nil {
+		return candidate
+	}
+
+	// Absolute fallback: return nil, note is dropped.
+	return nil
+}
+
+// findStealCandidate returns the lowest-priority non-fading voice, or nil if
+// all active voices are fading out.
+func (vc *voiceCollection) findStealCandidate() *voice {
 	var candidate *voice = nil
 	var lowestPriority float32 = math.MaxFloat32
 	for i := int32(0); i < vc.activeVoiceCount; i++ {
 		voice := vc.voices[i]
+		if voice.voiceState == voice_FadingOut {
+			continue
+		}
 		priority := voice.getPriority()
 		if priority < lowestPriority {
 			lowestPriority = priority

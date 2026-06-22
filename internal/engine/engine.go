@@ -335,75 +335,104 @@ func (e *Engine) BroadcastNote(eventType string, key, vel int, source string) {
 func (e *Engine) midiLoop(ctx context.Context) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	ticker := time.NewTicker(time.Millisecond)
-	defer ticker.Stop()
+
+	// Use a short timeout for epoll wait so we can periodically check
+	// the injected channel and context cancellation.
+	// The epoll wait itself provides event-driven wakeups for MIDI input,
+	// eliminating the 1ms ticker jitter.
+	const pollTimeout = 10 * time.Millisecond
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case inj := <-e.injected:
 			e.processInjectedNote(inj.action, inj.key, inj.vel, inj.target)
-		case <-ticker.C:
-			if e.input == nil || !e.input.Poll() {
-				continue
-			}
-			events, err := e.input.Read()
-			if err != nil {
-				log.Printf("MIDI read error: %v", err)
-				e.Broadcast(Event{Type: "midi_disconnect"})
-				e.input = nil
-				go e.reconnectMIDI(ctx)
-				continue
-			}
+			continue
+		default:
+		}
 
-			for _, ev := range events {
-				if ev.Type == midi.NoteOn {
-					e.BroadcastNote("note_on", ev.Key, ev.Value, "input")
-				} else if ev.Type == midi.NoteOff {
-					e.BroadcastNote("note_off", ev.Key, 0, "input")
-				}
+		if e.input == nil {
+			// No input device, just wait for injected events or context
+			select {
+			case <-ctx.Done():
+				return
+			case inj := <-e.injected:
+				e.processInjectedNote(inj.action, inj.key, inj.vel, inj.target)
+			case <-time.After(pollTimeout):
 			}
+			continue
+		}
 
-			r := e.router.Load()
-			if r == nil {
-				continue
+		// Block until MIDI data arrives or timeout
+		if !e.input.WaitEvent(pollTimeout) {
+			// Timeout or error: check for injected events
+			select {
+			case <-ctx.Done():
+				return
+			case inj := <-e.injected:
+				e.processInjectedNote(inj.action, inj.key, inj.vel, inj.target)
+			default:
 			}
-			for _, ev := range events {
-				// CC recording trigger: consume event without forwarding to router
-				if e.cfg.Recording.TriggerCC > 0 &&
-					ev.Type == midi.CC &&
-					ev.Key == e.cfg.Recording.TriggerCC &&
-					ev.Value >= 1 {
-					go func() {
-						if e.IsRecording() {
-							if _, err := e.StopRecording(); err != nil {
-								log.Printf("CC stop recording: %v", err)
-							}
-						} else {
-							if err := e.StartRecording(); err != nil {
-								log.Printf("CC start recording: %v", err)
-							}
+			continue
+		}
+
+		events, err := e.input.Read()
+		if err != nil {
+			log.Printf("MIDI read error: %v", err)
+			e.Broadcast(Event{Type: "midi_disconnect"})
+			e.input = nil
+			go e.reconnectMIDI(ctx)
+			continue
+		}
+
+		for _, ev := range events {
+			if ev.Type == midi.NoteOn {
+				e.BroadcastNote("note_on", ev.Key, ev.Value, "input")
+			} else if ev.Type == midi.NoteOff {
+				e.BroadcastNote("note_off", ev.Key, 0, "input")
+			}
+		}
+
+		r := e.router.Load()
+		if r == nil {
+			continue
+		}
+		for _, ev := range events {
+			// CC recording trigger: consume event without forwarding to router
+			if e.cfg.Recording.TriggerCC > 0 &&
+				ev.Type == midi.CC &&
+				ev.Key == e.cfg.Recording.TriggerCC &&
+				ev.Value >= 1 {
+				go func() {
+					if e.IsRecording() {
+						if _, err := e.StopRecording(); err != nil {
+							log.Printf("CC stop recording: %v", err)
 						}
-					}()
-					continue
-				}
-				result := r.Process(ev)
-				if result.Triggered {
-					go func() {
-						if err := e.NextProfile(); err != nil {
-							log.Printf("profile switch error: %v", err)
+					} else {
+						if err := e.StartRecording(); err != nil {
+							log.Printf("CC start recording: %v", err)
 						}
-					}()
-					continue
-				}
-				for _, out := range result.Events {
-					if out.Type == midi.NoteOn {
-						e.BroadcastNote("note_on", out.Key, out.Value, "output")
-					} else if out.Type == midi.NoteOff {
-						e.BroadcastNote("note_off", out.Key, 0, "output")
 					}
-					e.ring.Write(out)
+				}()
+				continue
+			}
+			result := r.Process(ev)
+			if result.Triggered {
+				go func() {
+					if err := e.NextProfile(); err != nil {
+						log.Printf("profile switch error: %v", err)
+					}
+				}()
+				continue
+			}
+			for _, out := range result.Events {
+				if out.Type == midi.NoteOn {
+					e.BroadcastNote("note_on", out.Key, out.Value, "output")
+				} else if out.Type == midi.NoteOff {
+					e.BroadcastNote("note_off", out.Key, 0, "output")
 				}
+				e.ringWrite(out)
 			}
 		}
 	}
@@ -412,6 +441,12 @@ func (e *Engine) midiLoop(ctx context.Context) {
 func (e *Engine) audioLoop(ctx context.Context) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+
+	// Pre-allocate batch buffer to drain ring buffer in bulk.
+	// This ensures chords (multiple NoteOn) are processed in a single iteration,
+	// getting enqueued to the synth's event queue together and rendered in the same block.
+	batch := make([]midi.Event, 256)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -422,21 +457,36 @@ func (e *Engine) audioLoop(ctx context.Context) {
 				time.Sleep(time.Millisecond)
 				continue
 			}
-			ev, ok := e.ring.Read()
-			if !ok {
+
+			// Bulk drain: read all available events from ring buffer
+			n := 0
+			for n < len(batch) {
+				ev, ok := e.ring.Read()
+				if !ok {
+					break
+				}
+				batch[n] = ev
+				n++
+			}
+			if n == 0 {
 				time.Sleep(100 * time.Microsecond)
 				continue
 			}
-			switch ev.Type {
-			case midi.NoteOn:
-				s.NoteOn(ev.Channel, ev.Key, ev.Value)
-			case midi.NoteOff:
-				s.NoteOff(ev.Channel, ev.Key)
-			case midi.CC:
-				s.CC(ev.Channel, ev.Key, ev.Value)
-			}
-			if rec := e.rec.Load(); rec != nil {
-				rec.Feed(ev)
+
+			// Process all events in this batch
+			for i := 0; i < n; i++ {
+				ev := batch[i]
+				switch ev.Type {
+				case midi.NoteOn:
+					s.NoteOn(ev.Channel, ev.Key, ev.Value)
+				case midi.NoteOff:
+					s.NoteOff(ev.Channel, ev.Key)
+				case midi.CC:
+					s.CC(ev.Channel, ev.Key, ev.Value)
+				}
+				if rec := e.rec.Load(); rec != nil {
+					rec.Feed(ev)
+				}
 			}
 		}
 	}
@@ -464,6 +514,28 @@ func (e *Engine) InjectNote(action string, key, vel int, target string) {
 	case e.injected <- injectedEvent{action: action, key: key, vel: vel, target: target}:
 	default:
 		log.Println("warning: injected note dropped (buffer full)")
+	}
+}
+
+// ringWrite writes a MIDI event to the ring buffer.
+// NoteOff events are guaranteed delivery (spin-wait with timeout) to prevent stuck notes.
+// NoteOn/CC events are dropped with a warning if the buffer is full.
+func (e *Engine) ringWrite(ev midi.Event) {
+	if ev.Type == midi.NoteOff {
+		deadline := time.Now().Add(50 * time.Millisecond)
+		for !e.ring.Write(ev) {
+			if time.Now().After(deadline) {
+				log.Printf("warning: NoteOff (ch=%d key=%d) dropped after 50ms timeout",
+					ev.Channel, ev.Key)
+				return
+			}
+			runtime.Gosched()
+		}
+		return
+	}
+	if !e.ring.Write(ev) {
+		log.Printf("warning: %d (ch=%d key=%d val=%d) dropped (ring buffer full)",
+			ev.Type, ev.Channel, ev.Key, ev.Value)
 	}
 }
 
@@ -500,7 +572,7 @@ func (e *Engine) processInjectedNote(action string, key, vel int, target string)
 			} else if out.Type == midi.NoteOff {
 				e.BroadcastNote("note_off", out.Key, 0, "output")
 			}
-			e.ring.Write(out)
+			e.ringWrite(out)
 		}
 	} else if target == "output" {
 		if evType == midi.NoteOn {
@@ -508,6 +580,6 @@ func (e *Engine) processInjectedNote(action string, key, vel int, target string)
 		} else {
 			e.BroadcastNote("note_off", key, 0, "output")
 		}
-		e.ring.Write(ev)
+		e.ringWrite(ev)
 	}
 }
