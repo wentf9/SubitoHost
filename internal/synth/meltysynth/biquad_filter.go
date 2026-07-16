@@ -44,7 +44,11 @@ func (bf *biQuadFilter) clearBuffer() {
 }
 
 func (bf *biQuadFilter) setLowPassFilter(cutoffFrequency float32, resonance float32) {
-	if cutoffFrequency >= 0.499*float32(bf.synthesizer.SampleRate) {
+	if !isFinite32(cutoffFrequency) || !isFinite32(resonance) || cutoffFrequency <= 0 || resonance <= 0 {
+		bf.active = false
+		return
+	}
+	if cutoffFrequency >= 0.49*float32(bf.synthesizer.SampleRate) {
 		bf.active = false
 		return
 	}
@@ -72,21 +76,16 @@ func (bf *biQuadFilter) process(block []float32) {
 	blockLength := len(block)
 
 	if bf.active {
-		// 计算当前音频块内，每个样本所需要平滑递增的系数步长
-		invBlock := 1.0 / float64(blockLength)
-		stepA0 := (bf.a0 - bf.cA0) * invBlock
-		stepA1 := (bf.a1 - bf.cA1) * invBlock
-		stepA2 := (bf.a2 - bf.cA2) * invBlock
-		stepA3 := (bf.a3 - bf.cA3) * invBlock
-		stepA4 := (bf.a4 - bf.cA4) * invBlock
+		// A fixed 5 ms time constant makes smoothing independent of block size.
+		smoothing := 1 - math.Exp(-1/(0.005*float64(bf.synthesizer.SampleRate)))
 
 		for t := range blockLength {
 			// 每处理一个声音样本，滤波器系数就非常平滑地移动一点点
-			bf.cA0 += stepA0
-			bf.cA1 += stepA1
-			bf.cA2 += stepA2
-			bf.cA3 += stepA3
-			bf.cA4 += stepA4
+			bf.cA0 += (bf.a0 - bf.cA0) * smoothing
+			bf.cA1 += (bf.a1 - bf.cA1) * smoothing
+			bf.cA2 += (bf.a2 - bf.cA2) * smoothing
+			bf.cA3 += (bf.a3 - bf.cA3) * smoothing
+			bf.cA4 += (bf.a4 - bf.cA4) * smoothing
 
 			// 将输入提升为双精度参与高精度运算
 			input := float64(block[t])
@@ -95,13 +94,10 @@ func (bf *biQuadFilter) process(block []float32) {
 			output := bf.cA0*input + bf.cA1*bf.x1 + bf.cA2*bf.x2 - bf.cA3*bf.y1 - bf.cA4*bf.y2
 
 			// 转换为单精度用于验证和输出
-			out32 := float32(output)
-			// Denormal protection: flush float32 output to 0 to avoid CPU
-			// performance degradation, but preserve the float64 internal state
-			// (output -> y1) so the feedback loop decays naturally.
-			if (math.Float32bits(out32) & 0x7FFFFFFF) < 8388608 {
-				out32 = 0
+			if math.Abs(output) < 1e-30 {
+				output = 0
 			}
+			out32 := float32(output)
 
 			bf.x2 = bf.x1
 			bf.x1 = input
@@ -112,9 +108,7 @@ func (bf *biQuadFilter) process(block []float32) {
 			block[t] = out32
 		}
 
-		// Do NOT force-align cA to target at block end.
-		// Keeping the residual allows smooth continuation when cutoff changes
-		// mid-block via CC; the next block continues interpolating from cA.
+		bf.snapCoefficientsToTarget()
 
 	} else {
 		// 非活跃状态下，也要以高精度保存最后两个样本
@@ -125,7 +119,33 @@ func (bf *biQuadFilter) process(block []float32) {
 	}
 }
 
+func isFinite32(value float32) bool {
+	return !math.IsNaN(float64(value)) && !math.IsInf(float64(value), 0)
+}
+
+func (bf *biQuadFilter) snapCoefficientsToTarget() {
+	if math.Abs(bf.a0-bf.cA0) < 1e-12 {
+		bf.cA0 = bf.a0
+	}
+	if math.Abs(bf.a1-bf.cA1) < 1e-12 {
+		bf.cA1 = bf.a1
+	}
+	if math.Abs(bf.a2-bf.cA2) < 1e-12 {
+		bf.cA2 = bf.a2
+	}
+	if math.Abs(bf.a3-bf.cA3) < 1e-12 {
+		bf.cA3 = bf.a3
+	}
+	if math.Abs(bf.a4-bf.cA4) < 1e-12 {
+		bf.cA4 = bf.a4
+	}
+}
+
 func (bf *biQuadFilter) setCoefficients(a0 float64, a1 float64, a2 float64, b0 float64, b1 float64, b2 float64) {
+	if a0 == 0 || math.IsNaN(a0) || math.IsInf(a0, 0) {
+		bf.active = false
+		return
+	}
 	bf.a0 = b0 / a0
 	bf.a1 = b1 / a0
 	bf.a2 = b2 / a0

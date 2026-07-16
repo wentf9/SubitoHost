@@ -12,6 +12,7 @@ import (
 const fracBits int32 = 24
 const fracUnit int64 = 1 << fracBits
 const fpToSample float32 = float32(1) / float32(32768*fracUnit)
+const oscillatorEndTailSamples = 64
 
 type oscillator struct {
 	synthesizer      *Synthesizer
@@ -28,6 +29,11 @@ type oscillator struct {
 	sampleRateRatio  float32
 	looping          bool
 	position_fp      int64
+	lastSample       float32
+	previousSample   float32
+	endTailPosition  int32
+	endTailActive    bool
+	finished         bool
 }
 
 func newOscillator(s *Synthesizer) *oscillator {
@@ -60,6 +66,11 @@ func (o *oscillator) start(data []int16, loopMode int32, sampleRate int32, start
 	}
 
 	o.position_fp = int64(start) << fracBits
+	o.lastSample = 0
+	o.previousSample = 0
+	o.endTailPosition = 0
+	o.endTailActive = false
+	o.finished = false
 }
 
 func (o *oscillator) release() {
@@ -85,27 +96,24 @@ func (o *oscillator) fillBlock(block []float32, pitchRatio float64) bool {
 }
 
 func (o *oscillator) fillBlock_NoLoop(block []float32, pitchRatio_fp int64) bool {
+	if o.finished {
+		clear(block)
+		return false
+	}
+
 	blockLength := len(block)
 
 	for t := 0; t < blockLength; t++ {
+		if o.endTailActive {
+			o.writeEndTail(block[t:])
+			return true
+		}
 		index := int32(o.position_fp >> fracBits)
 		if index >= o.sampleEnd {
-			if t > 0 {
-				// Linear fade-out from the last valid sample to 0.
-				// This prevents the hard step discontinuity that causes click noise
-				// when the sample end is not at a zero-crossing point.
-				lastSample := block[t-1]
-				remaining := blockLength - t
-				for i := 0; i < remaining; i++ {
-					fadeGain := float32(1.0 - float64(i+1)/float64(remaining))
-					if fadeGain < 0 {
-						fadeGain = 0
-					}
-					block[t+i] = lastSample * fadeGain
-				}
-				return true
-			}
-			return false
+			o.endTailActive = true
+			o.endTailPosition = 0
+			o.writeEndTail(block[t:])
+			return true
 		}
 
 		idx0 := index - 1
@@ -132,12 +140,42 @@ func (o *oscillator) fillBlock_NoLoop(block []float32, pitchRatio_fp int64) bool
 
 		// Cubic Hermite Interpolation (Float64 Precision)
 		val := x1 + 0.5*tVal*(x2-x0+tVal*(2.0*x0-5.0*x1+4.0*x2-x3+tVal*(3.0*(x1-x2)+x3-x0)))
-		block[t] = float32(val * (1.0 / 32768.0))
+		sample := float32(val * (1.0 / 32768.0))
+		block[t] = sample
+		o.previousSample = o.lastSample
+		o.lastSample = sample
 
 		o.position_fp += pitchRatio_fp
 	}
 
 	return true
+}
+
+// writeEndTail continues the final local slope under a raised-cosine window.
+// Unlike repeating the final sample, this preserves the waveform direction at
+// the boundary. State persists across blocks and always lasts exactly 64
+// samples, independent of where the sample ended within a render block.
+func (o *oscillator) writeEndTail(block []float32) {
+	slope := o.lastSample - o.previousSample
+	for i := range block {
+		if o.endTailPosition >= oscillatorEndTailSamples {
+			clear(block[i:])
+			o.endTailActive = false
+			o.finished = true
+			return
+		}
+		step := o.endTailPosition + 1
+		phase := float64(step) / oscillatorEndTailSamples
+		window := float32(0.5 * (1 + math.Cos(math.Pi*phase)))
+		predicted := o.lastSample + slope*float32(step)
+		predicted = calcClamp(predicted, -1, 1)
+		block[i] = predicted * window
+		o.endTailPosition++
+	}
+	if o.endTailPosition >= oscillatorEndTailSamples {
+		o.endTailActive = false
+		o.finished = true
+	}
 }
 
 func (o *oscillator) fillBlock_Continuous(block []float32, pitchRatio_fp int64) bool {

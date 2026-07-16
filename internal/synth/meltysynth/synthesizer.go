@@ -284,6 +284,7 @@ func (s *Synthesizer) NoteOffAllChannel(channel int32, immediate bool) {
 	if immediate {
 		for i := 0; i < int(s.voices.activeVoiceCount); i++ {
 			if s.voices.voices[i].channel == channel {
+				s.voices.addFadeTail(s.voices.voices[i])
 				s.voices.voices[i].kill()
 			}
 		}
@@ -312,7 +313,7 @@ func (s *Synthesizer) ResetAllControllersChannel(channel int32) {
 }
 
 func (s *Synthesizer) Reset() {
-	s.voices.clear()
+	s.voices.reset()
 
 	channelCount := len(s.channels)
 	for i := range channelCount {
@@ -352,9 +353,10 @@ func (s *Synthesizer) Render(left []float32, right []float32) {
 
 func (s *Synthesizer) renderBlock() {
 	blockSize := int(s.BlockSize)
-	activeVoiceCount := int(s.voices.activeVoiceCount)
-
 	s.voices.process()
+	// process can remove and swap voices. Mix only the resulting active set;
+	// using the pre-process count replays stale blocks from retired voices.
+	activeVoiceCount := int(s.voices.activeVoiceCount)
 
 	for i := range blockSize {
 		s.blockLeft[i] = 0
@@ -370,6 +372,7 @@ func (s *Synthesizer) renderBlock() {
 		var currentGainRight = s.MasterVolume * voice.currentMixGainRight
 		s.writeBlock(previousGainRight, currentGainRight, voice.block, s.blockRight)
 	}
+	s.voices.renderFadeTails(s.blockLeft, s.blockRight, s.MasterVolume)
 
 	if s.EnableReverbAndChorus {
 		for i := range blockSize {
