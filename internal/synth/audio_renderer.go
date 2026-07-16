@@ -4,22 +4,18 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/ebitengine/oto/v3"
 	"github.com/wentf9/subitohost/internal/config"
 )
 
-var (
-	otoCtx     *oto.Context
-	otoCtxOnce sync.Once
-	otoCtxErr  error
-)
+type audioDevice interface {
+	Close()
+}
 
 // AudioRenderer is the process-wide PCM source. Its mutable rendering state is
-// owned exclusively by Oto's reader goroutine; producers only publish pending
+// owned exclusively by the audio reader goroutine; producers only publish pending
 // fully initialized synths through an atomic pointer.
 type AudioRenderer struct {
 	pending atomic.Pointer[Synth]
@@ -39,10 +35,10 @@ type AudioRenderer struct {
 	callbackOverruns atomic.Uint64
 }
 
-// AudioOutput owns the only Oto player in the process.
+// AudioOutput owns the only platform audio stream in the process.
 type AudioOutput struct {
 	renderer         *AudioRenderer
-	player           *oto.Player
+	device           audioDevice
 	sampleRate       int
 	framesPerPeriod  int
 	periods          int
@@ -82,47 +78,22 @@ func newAudioRenderer(cfg config.Audio) *AudioRenderer {
 func newAudioOutput(cfg config.Audio) (*AudioOutput, error) {
 	sampleRate, frames, periods := normalizedAudioConfig(cfg)
 	deviceBuffer := time.Duration(int64(time.Second) * int64(frames*periods) / int64(sampleRate))
-	var creationErr error
-	otoCtxOnce.Do(func() {
-		options := &oto.NewContextOptions{
-			SampleRate:      sampleRate,
-			ChannelCount:    2,
-			Format:          oto.FormatFloat32LE,
-			BufferSize:      deviceBuffer,
-			ApplicationName: "SubitoHost",
-		}
-		var ready chan struct{}
-		otoCtx, ready, creationErr = oto.NewContext(options)
-		if creationErr != nil {
-			otoCtxErr = creationErr
-			return
-		}
-		<-ready
-	})
-	if otoCtxErr != nil {
-		return nil, fmt.Errorf("oto context initialization failed: %w", otoCtxErr)
-	}
-	if creationErr != nil {
-		return nil, fmt.Errorf("oto context initialization failed: %w", creationErr)
-	}
-
 	renderer := newAudioRenderer(cfg)
-	player := otoCtx.NewPlayer(renderer)
-	// This is Oto's source/read-ahead buffer. Keep it to one configured period;
-	// the device buffer above supplies the configured number of periods.
-	player.SetBufferSize(frames * 2 * 4)
-	player.Play()
+	device, estimatedLatency, backend, err := openPlatformAudioDevice(renderer, sampleRate, frames, periods, deviceBuffer)
+	if err != nil {
+		return nil, fmt.Errorf("audio output initialization failed: %w", err)
+	}
 
 	output := &AudioOutput{
 		renderer:         renderer,
-		player:           player,
+		device:           device,
 		sampleRate:       sampleRate,
 		framesPerPeriod:  frames,
 		periods:          periods,
-		estimatedLatency: deviceBuffer + time.Duration(int64(time.Second)*int64(frames)/int64(sampleRate)),
+		estimatedLatency: estimatedLatency,
 	}
-	log.Printf("audio output: sample_rate=%d frames_per_period=%d periods=%d estimated_latency=%s",
-		sampleRate, frames, periods, output.estimatedLatency)
+	log.Printf("audio output: backend=%s sample_rate=%d frames_per_period=%d periods=%d estimated_latency=%s",
+		backend, sampleRate, frames, periods, output.estimatedLatency)
 	return output, nil
 }
 
@@ -140,12 +111,12 @@ type AudioRuntime struct {
 
 func runtimeAudioConfig(cfg config.Audio) AudioRuntime {
 	sampleRate, frames, periods := normalizedAudioConfig(cfg)
-	deviceAndReadAheadFrames := frames * (periods + 1)
+	deviceFrames := frames * periods
 	return AudioRuntime{
 		SampleRate:         sampleRate,
 		FramesPerPeriod:    frames,
 		Periods:            periods,
-		EstimatedLatencyMS: float64(deviceAndReadAheadFrames) * 1000 / float64(sampleRate),
+		EstimatedLatencyMS: float64(deviceFrames) * 1000 / float64(sampleRate),
 	}
 }
 
@@ -154,8 +125,8 @@ func (o *AudioOutput) publish(s *Synth) {
 }
 
 func (o *AudioOutput) Close() {
-	if o.player != nil {
-		o.player.Pause()
+	if o.device != nil {
+		o.device.Close()
 	}
 }
 

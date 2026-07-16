@@ -11,7 +11,6 @@ import (
 
 const fracBits int32 = 24
 const fracUnit int64 = 1 << fracBits
-const fpToSample float32 = float32(1) / float32(32768*fracUnit)
 const oscillatorEndTailSamples = 64
 
 type oscillator struct {

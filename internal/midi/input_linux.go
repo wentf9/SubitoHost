@@ -4,8 +4,9 @@
 package midi
 
 import (
-	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,17 +18,18 @@ import (
 
 // Input wraps a Linux raw MIDI device, read via epoll for low-latency event notification.
 type Input struct {
-	file       *os.File
-	fd         int
-	epollFd    int
-	err        error
-	closed     bool
-	mu         sync.Mutex
-	buf        []Event
-	reader     *bufio.Reader
-	running    byte
-	dataLen    int
-	dataBuf    []byte
+	file    *os.File
+	fd      int
+	epollFd int
+	err     error
+	closed  bool
+	mu      sync.Mutex
+	readMu  sync.Mutex
+	buf     []Event
+	running byte
+	dataLen int
+	dataBuf []byte
+	inSysEx bool
 }
 
 // ListDevices returns all available MIDI devices by scanning /dev/snd/midiC*D*.
@@ -48,16 +50,20 @@ func ListDevices() ([]DeviceInfo, error) {
 			continue
 		}
 
-		name, ok := cardNames[card]
-		if !ok {
-			sysPath := fmt.Sprintf("/sys/class/sound/card%d/id", card)
-			if data, err := os.ReadFile(sysPath); err == nil {
-				name = strings.TrimSpace(string(data))
+		name := rawMIDIPortName(card, device)
+		if name == "" {
+			var ok bool
+			name, ok = cardNames[card]
+			if !ok {
+				sysPath := fmt.Sprintf("/sys/class/sound/card%d/id", card)
+				if data, err := os.ReadFile(sysPath); err == nil {
+					name = strings.TrimSpace(string(data))
+				} else {
+					name = fmt.Sprintf("ALSA MIDI Card %d Dev %d", card, device)
+				}
 			} else {
-				name = fmt.Sprintf("ALSA MIDI Card %d Dev %d", card, device)
+				name = fmt.Sprintf("%s (MIDI %d:%d)", name, card, device)
 			}
-		} else {
-			name = fmt.Sprintf("%s (MIDI %d:%d)", name, card, device)
 		}
 
 		devices = append(devices, DeviceInfo{
@@ -68,6 +74,24 @@ func ListDevices() ([]DeviceInfo, error) {
 		})
 	}
 	return devices, nil
+}
+
+func rawMIDIPortName(card, device int) string {
+	path := fmt.Sprintf("/proc/asound/card%d/midi%d", card, device)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return parseRawMIDIPortName(string(data))
+}
+
+func parseRawMIDIPortName(data string) string {
+	name, _, _ := strings.Cut(data, "\n")
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	return name + " MIDI 1"
 }
 
 // parseCards parses /proc/asound/cards to get friendly names.
@@ -169,7 +193,6 @@ func OpenInput(deviceID int) (*Input, error) {
 		fd:      fd,
 		epollFd: epollFd,
 		buf:     make([]Event, 0),
-		reader:  bufio.NewReader(file),
 	}
 	return inp, nil
 }
@@ -177,6 +200,14 @@ func OpenInput(deviceID int) (*Input, error) {
 // WaitEvent blocks until MIDI data is available or timeout elapses.
 // Returns true if data is available to read, false on timeout or error.
 func (in *Input) WaitEvent(timeout time.Duration) bool {
+	in.mu.Lock()
+	if in.closed || in.epollFd < 0 {
+		in.mu.Unlock()
+		return false
+	}
+	epollFd := in.epollFd
+	in.mu.Unlock()
+
 	events := make([]syscall.EpollEvent, 1)
 	var msTimeout int
 	if timeout < 0 {
@@ -184,7 +215,7 @@ func (in *Input) WaitEvent(timeout time.Duration) bool {
 	} else {
 		msTimeout = int(timeout / time.Millisecond)
 	}
-	n, err := syscall.EpollWait(in.epollFd, events, msTimeout)
+	n, err := syscall.EpollWait(epollFd, events, msTimeout)
 	if err != nil {
 		// EINTR is normal when interrupted by signals
 		if err == syscall.EINTR {
@@ -217,8 +248,12 @@ func (in *Input) Read() ([]Event, error) {
 	}
 	in.mu.Unlock()
 
-	// Parse any available bytes from the device into events
-	in.parseAvailable()
+	// Use syscall.Read here rather than os.File.Read. os.File integrates a
+	// non-blocking descriptor with Go's runtime poller and waits on EAGAIN,
+	// which would prevent this drain loop from ever returning to the engine.
+	if err := in.parseAvailable(); err != nil {
+		return nil, err
+	}
 
 	in.mu.Lock()
 	defer in.mu.Unlock()
@@ -232,48 +267,75 @@ func (in *Input) Read() ([]Event, error) {
 
 // parseAvailable reads all available bytes from the non-blocking fd and parses
 // them into MIDI events, buffering them in in.buf.
-func (in *Input) parseAvailable() {
+func (in *Input) parseAvailable() error {
+	in.readMu.Lock()
+	defer in.readMu.Unlock()
+
+	in.mu.Lock()
+	if in.closed {
+		in.mu.Unlock()
+		return os.ErrClosed
+	}
+	fd := in.fd
+	in.mu.Unlock()
+
+	var data [256]byte
 	for {
-		b, err := in.reader.ReadByte()
-		if err != nil {
-			// EAGAIN means no more data available (non-blocking fd)
-			break
+		n, err := syscall.Read(fd, data[:])
+		if n > 0 {
+			for _, b := range data[:n] {
+				in.parseByte(b)
+			}
 		}
-		in.parseByte(b)
+
+		if err != nil {
+			switch {
+			case errors.Is(err, syscall.EINTR):
+				continue
+			case errors.Is(err, syscall.EAGAIN), errors.Is(err, syscall.EWOULDBLOCK):
+				return nil
+			default:
+				return fmt.Errorf("read raw midi device: %w", err)
+			}
+		}
+		if n == 0 {
+			return io.EOF
+		}
 	}
 }
 
 // parseByte processes a single raw MIDI byte, maintaining running status state.
 func (in *Input) parseByte(b byte) {
+	// Realtime messages can occur between any two MIDI bytes and do not alter
+	// running status or SysEx state.
+	if b >= 0xF8 {
+		return
+	}
+
+	if in.inSysEx {
+		switch {
+		case b == 0xF7:
+			in.inSysEx = false
+			return
+		case b < 0x80:
+			return
+		default:
+			// A new non-realtime status also terminates malformed/incomplete
+			// SysEx, then gets processed normally below.
+			in.inSysEx = false
+		}
+	}
+
 	if b >= 0x80 {
 		// Status byte
 		if b >= 0xF0 {
 			// System messages
-			if b >= 0xF8 {
-				// Realtime message, ignore
-				return
-			}
 			// Clear running status for non-realtime system messages
 			in.running = 0
 			in.dataLen = 0
 			in.dataBuf = nil
-
-			// Skip SysEx content
 			if b == 0xF0 {
-				for {
-					sb, err := in.reader.ReadByte()
-					if err != nil {
-						break
-					}
-					if sb == 0xF7 {
-						break
-					}
-					if sb >= 0x80 && sb < 0xF8 {
-						// Unread and process in next call
-						_ = in.reader.UnreadByte()
-						break
-					}
-				}
+				in.inSysEx = true
 			}
 			return
 		}
@@ -281,6 +343,10 @@ func (in *Input) parseByte(b byte) {
 		// Channel voice message
 		in.running = b
 		in.dataLen = getDataLen(b)
+		if in.dataLen == 0 {
+			in.running = 0
+			return
+		}
 		in.dataBuf = make([]byte, 0, in.dataLen)
 		return
 	}
@@ -340,11 +406,18 @@ func (in *Input) Close() error {
 		return nil
 	}
 	in.closed = true
+	epollFd := in.epollFd
+	in.epollFd = -1
 	in.mu.Unlock()
 
-	if in.epollFd >= 0 {
-		syscall.Close(in.epollFd)
-		in.epollFd = -1
+	if epollFd >= 0 {
+		_ = syscall.Close(epollFd)
 	}
-	return in.file.Close()
+
+	// Do not close and potentially recycle fd while a raw syscall.Read is
+	// using it.
+	in.readMu.Lock()
+	err := in.file.Close()
+	in.readMu.Unlock()
+	return err
 }

@@ -103,13 +103,27 @@ func TestNormalizedAudioConfig(t *testing.T) {
 	}
 }
 
-func TestRuntimeAudioConfigReportsTotalConfiguredLatency(t *testing.T) {
+func TestRuntimeAudioConfigReportsConfiguredDeviceLatency(t *testing.T) {
 	runtime := runtimeAudioConfig(config.Audio{SampleRate: 48000, BufferSize: 128, Periods: 2})
 	if runtime.SampleRate != 48000 || runtime.FramesPerPeriod != 128 || runtime.Periods != 2 {
 		t.Fatalf("unexpected runtime config: %+v", runtime)
 	}
-	if runtime.EstimatedLatencyMS != 8 {
-		t.Fatalf("EstimatedLatencyMS = %v, want 8", runtime.EstimatedLatencyMS)
+	const want = float64(256) * 1000 / 48000
+	if runtime.EstimatedLatencyMS != want {
+		t.Fatalf("EstimatedLatencyMS = %v, want %v", runtime.EstimatedLatencyMS, want)
+	}
+}
+
+func TestAudioRendererHandlesLargeSinkQuantum(t *testing.T) {
+	r := newAudioRenderer(config.Audio{SampleRate: 48000, BufferSize: 128, Periods: 2})
+	r.current = &Synth{}
+	buf := make([]byte, 1024*2*4)
+	n, err := r.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(buf) {
+		t.Fatalf("Read returned %d bytes, want complete %d-byte sink quantum", n, len(buf))
 	}
 }
 

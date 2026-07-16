@@ -30,6 +30,7 @@ type Engine struct {
 	swap          *synth.SwapManager
 	ring          *ringbuf.Buffer[midi.Event]
 	router        atomic.Pointer[router.Router]
+	inputMu       sync.RWMutex // protects input replacement and reconnects
 	input         *midi.Input
 	subsMu        sync.Mutex // protects subs
 	subs          []chan Event
@@ -123,8 +124,12 @@ func (e *Engine) activateCurrentProfile() error {
 }
 
 func (e *Engine) ConnectMIDI(deviceID int) error {
+	e.inputMu.Lock()
+	defer e.inputMu.Unlock()
+
 	if e.input != nil {
-		e.input.Close()
+		_ = e.input.Close()
+		e.input = nil
 	}
 	inp, err := midi.OpenInput(deviceID)
 	if err != nil {
@@ -132,6 +137,26 @@ func (e *Engine) ConnectMIDI(deviceID int) error {
 	}
 	e.input = inp
 	return nil
+}
+
+func (e *Engine) currentMIDIInput() *midi.Input {
+	e.inputMu.RLock()
+	defer e.inputMu.RUnlock()
+	return e.input
+}
+
+// clearMIDIInput disconnects inp only if it is still the active generation.
+// A stale read error from a device closed during manual reconnect must not
+// clear the newly opened input.
+func (e *Engine) clearMIDIInput(inp *midi.Input) bool {
+	e.inputMu.Lock()
+	defer e.inputMu.Unlock()
+	if e.input != inp {
+		return false
+	}
+	e.input = nil
+	_ = inp.Close()
+	return true
 }
 
 func (e *Engine) AutoConnectMIDI() error {
@@ -162,8 +187,8 @@ func (e *Engine) Stop() {
 			log.Printf("stop recording on shutdown: %v", err)
 		}
 	}
-	if e.input != nil {
-		e.input.Close()
+	if inp := e.currentMIDIInput(); inp != nil {
+		e.clearMIDIInput(inp)
 	}
 	e.swap.Close()
 }
@@ -363,7 +388,8 @@ func (e *Engine) midiLoop(ctx context.Context) {
 		default:
 		}
 
-		if e.input == nil {
+		inp := e.currentMIDIInput()
+		if inp == nil {
 			// No input device, just wait for injected events or context
 			select {
 			case <-ctx.Done():
@@ -376,7 +402,7 @@ func (e *Engine) midiLoop(ctx context.Context) {
 		}
 
 		// Block until MIDI data arrives or timeout
-		if !e.input.WaitEvent(pollTimeout) {
+		if !inp.WaitEvent(pollTimeout) {
 			// Timeout or error: check for injected events
 			select {
 			case <-ctx.Done():
@@ -388,11 +414,13 @@ func (e *Engine) midiLoop(ctx context.Context) {
 			continue
 		}
 
-		events, err := e.input.Read()
+		events, err := inp.Read()
 		if err != nil {
+			if !e.clearMIDIInput(inp) {
+				continue
+			}
 			log.Printf("MIDI read error: %v", err)
 			e.Broadcast(Event{Type: "midi_disconnect"})
-			e.input = nil
 			go e.reconnectMIDI(ctx)
 			continue
 		}
