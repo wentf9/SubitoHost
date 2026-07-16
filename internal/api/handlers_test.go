@@ -28,6 +28,18 @@ func TestGetStatus(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("status = %d", w.Code)
 	}
+	var response map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"callback_count", "callback_max_ms", "callback_overruns", "midi_queue", "synth_queue"} {
+		if _, ok := response[field]; !ok {
+			t.Errorf("status response missing %q", field)
+		}
+	}
+	if available, ok := response["hardware_xruns_available"].(bool); !ok || available {
+		t.Errorf("hardware_xruns_available = %v, want false without portable Oto support", response["hardware_xruns_available"])
+	}
 }
 
 func TestSetlistGotoNoSetlist(t *testing.T) {

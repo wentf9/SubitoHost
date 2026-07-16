@@ -24,22 +24,24 @@ type Event struct {
 }
 
 type Engine struct {
-	cfg          *config.Config
-	mu           sync.Mutex // protects state and setlistPath
-	state        *setlist.State
-	swap         *synth.SwapManager
-	ring         *ringbuf.Buffer[midi.Event]
-	router       atomic.Pointer[router.Router]
-	input        *midi.Input
-	subsMu       sync.Mutex // protects subs
-	subs         []chan Event
-	cancel       context.CancelFunc
-	setlistPath  string
-	injected     chan injectedEvent
-	rec          atomic.Pointer[recorder.Recorder]
-	recMu        sync.Mutex // protects recStatus, recStartedAt
-	recStatus    string     // "idle", "recording", "rendering"
-	recStartedAt time.Time
+	cfg           *config.Config
+	mu            sync.Mutex // protects state and setlistPath
+	state         *setlist.State
+	swap          *synth.SwapManager
+	ring          *ringbuf.Buffer[midi.Event]
+	router        atomic.Pointer[router.Router]
+	input         *midi.Input
+	subsMu        sync.Mutex // protects subs
+	subs          []chan Event
+	cancel        context.CancelFunc
+	setlistPath   string
+	injected      chan injectedEvent
+	rec           atomic.Pointer[recorder.Recorder]
+	recMu         sync.Mutex // protects recStatus, recStartedAt
+	recStatus     string     // "idle", "recording", "rendering"
+	recStartedAt  time.Time
+	ringDropped   atomic.Uint64
+	ringHighWater atomic.Uint64
 }
 
 type injectedEvent struct {
@@ -201,9 +203,18 @@ func (e *Engine) State() *setlist.State {
 	defer e.mu.Unlock()
 	return e.state
 }
-func (e *Engine) Config() *config.Config { return e.cfg }
-func (e *Engine) SetGain(gain float64)   { e.swap.SetGain(gain) }
-func (e *Engine) Gain() float64          { return e.swap.Gain() }
+func (e *Engine) Config() *config.Config                { return e.cfg }
+func (e *Engine) SetGain(gain float64)                  { e.swap.SetGain(gain) }
+func (e *Engine) Gain() float64                         { return e.swap.Gain() }
+func (e *Engine) AudioRuntime() synth.AudioRuntime      { return e.swap.AudioRuntime() }
+func (e *Engine) SynthQueueMetrics() synth.QueueMetrics { return e.swap.QueueMetrics() }
+
+func (e *Engine) MIDIQueueMetrics() synth.QueueMetrics {
+	return synth.QueueMetrics{
+		Depth: e.ring.Len(), Capacity: e.ring.Cap(),
+		HighWater: e.ringHighWater.Load(), Dropped: e.ringDropped.Load(),
+	}
+}
 
 // StartRecording starts a new recording session for the current profile.
 func (e *Engine) StartRecording() error {
@@ -518,22 +529,25 @@ func (e *Engine) InjectNote(action string, key, vel int, target string) {
 }
 
 // ringWrite writes a MIDI event to the ring buffer.
-// NoteOff events are guaranteed delivery (spin-wait with timeout) to prevent stuck notes.
-// NoteOn/CC events are dropped with a warning if the buffer is full.
+// A failed NoteOff escalates to AllNotesOff so queue pressure cannot leave a
+// permanently stuck voice. The MIDI thread never spin-waits.
 func (e *Engine) ringWrite(ev midi.Event) {
-	if ev.Type == midi.NoteOff {
-		deadline := time.Now().Add(50 * time.Millisecond)
-		for !e.ring.Write(ev) {
-			if time.Now().After(deadline) {
-				log.Printf("warning: NoteOff (ch=%d key=%d) dropped after 50ms timeout",
-					ev.Channel, ev.Key)
-				return
+	if e.ring.Write(ev) {
+		depth := uint64(e.ring.Len())
+		for maximum := e.ringHighWater.Load(); depth > maximum; maximum = e.ringHighWater.Load() {
+			if e.ringHighWater.CompareAndSwap(maximum, depth) {
+				break
 			}
-			runtime.Gosched()
 		}
 		return
 	}
-	if !e.ring.Write(ev) {
+	e.ringDropped.Add(1)
+	{
+		if ev.Type == midi.NoteOff {
+			if s := e.swap.Active.Load(); s != nil {
+				s.AllNotesOff()
+			}
+		}
 		log.Printf("warning: %d (ch=%d key=%d val=%d) dropped (ring buffer full)",
 			ev.Type, ev.Channel, ev.Key, ev.Value)
 	}

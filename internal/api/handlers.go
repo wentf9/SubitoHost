@@ -20,11 +20,20 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	audio := s.engine.AudioRuntime()
 	resp := map[string]interface{}{
-		"audio_backend": s.engine.Config().Audio.Backend,
-		"sample_rate":   s.engine.Config().Audio.SampleRate,
-		"buffer_size":   s.engine.Config().Audio.BufferSize,
-		"gain":          s.engine.Gain(),
+		"audio_backend":            s.engine.Config().Audio.Backend,
+		"sample_rate":              audio.SampleRate,
+		"buffer_size":              audio.FramesPerPeriod,
+		"periods":                  audio.Periods,
+		"estimated_latency_ms":     audio.EstimatedLatencyMS,
+		"gain":                     s.engine.Gain(),
+		"callback_count":           audio.CallbackCount,
+		"callback_max_ms":          audio.CallbackMaxMS,
+		"callback_overruns":        audio.CallbackOverruns,
+		"hardware_xruns_available": audio.HardwareXrunsAvailable,
+		"midi_queue":               s.engine.MIDIQueueMetrics(),
+		"synth_queue":              s.engine.SynthQueueMetrics(),
 	}
 	state := s.engine.State()
 	if state != nil {

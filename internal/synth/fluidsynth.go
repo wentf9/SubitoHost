@@ -8,42 +8,11 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
-	"time"
 
-	"github.com/ebitengine/oto/v3"
 	"github.com/wentf9/subitohost/internal/config"
 	"github.com/wentf9/subitohost/internal/ringbuf"
 	"github.com/wentf9/subitohost/internal/synth/meltysynth"
 )
-
-var (
-	otoCtx     *oto.Context
-	otoCtxOnce sync.Once
-	otoCtxErr  error
-)
-
-func getOtoContext(sampleRate int) (*oto.Context, error) {
-	var err error
-	otoCtxOnce.Do(func() {
-		op := &oto.NewContextOptions{
-			SampleRate:   sampleRate,
-			ChannelCount: 2,
-			Format:       oto.FormatFloat32LE,
-			BufferSize:   30 * time.Millisecond,
-		}
-		var ready chan struct{}
-		otoCtx, ready, err = oto.NewContext(op)
-		if err == nil {
-			<-ready
-		} else {
-			otoCtxErr = err
-		}
-	})
-	if otoCtxErr != nil {
-		return nil, otoCtxErr
-	}
-	return otoCtx, err
-}
 
 // synthEvent kinds for the lock-free event queue.
 const (
@@ -52,7 +21,6 @@ const (
 	evCC            uint8 = 2
 	evProgramChange uint8 = 3
 	evAllNotesOff   uint8 = 4
-	evSetGain       uint8 = 5
 )
 
 // synthEvent is the carrier for MIDI events in the lock-free queue.
@@ -63,7 +31,6 @@ const (
 //	CC:            data1=cc, data2=value
 //	ProgramChange: data1=bank, data2=program
 //	AllNotesOff:   data1=0, data2=0
-//	SetGain:       data1=float64 bits, data2=0
 type synthEvent struct {
 	kind    uint8
 	channel int32
@@ -71,23 +38,25 @@ type synthEvent struct {
 	data2   int32
 }
 
-// Synth wraps a pure Go MeltySynth instance and ebitengine/oto/v3 driver.
+// Synth wraps one pure-Go MeltySynth rendering state. Realtime Synth values do
+// not own audio devices or Oto players.
 type Synth struct {
-	mu           sync.Mutex // protects syn, player, activePlayer, gain, muted
-	sampleRate   int
-	syn          *meltysynth.Synthesizer
-	otoCtx       *oto.Context
-	player       *oto.Player
-	gain         float64
-	activePlayer *Player
-	isHeadless   bool
+	mu            sync.Mutex // protects offline player setup only
+	sampleRate    int
+	syn           *meltysynth.Synthesizer
+	gain          float64
+	gainTarget    float64
+	gainStep      float64
+	gainRemaining int
+	activePlayer  *Player
+	isHeadless    bool
 
-	// evQueue is a lock-free SPSC queue: MIDI thread produces, audio Read
-	// thread consumes. nil in headless mode (direct calls instead).
-	evQueue *ringbuf.Buffer[synthEvent]
-
-	// muted suppresses audio output (used during synth swap).
-	muted bool
+	// evQueue is a bounded MPSC queue. The audio callback is its sole consumer.
+	evQueue              *ringbuf.Buffer[synthEvent]
+	targetGain           atomic.Uint64
+	emergencyAllNotesOff atomic.Bool
+	queueDropped         atomic.Uint64
+	queueHighWater       atomic.Uint64
 
 	// DC blocker state (only accessed in Read/WriteS16, no lock needed).
 	dcLeftX  float32
@@ -104,21 +73,12 @@ func New(cfg config.Audio) (*Synth, error) {
 	s := &Synth{
 		sampleRate: cfg.SampleRate,
 		gain:       0.5, // Default master volume in meltysynth.
+		gainTarget: 0.5,
 		isHeadless: false,
 		evQueue:    ringbuf.New[synthEvent](512),
 	}
+	s.targetGain.Store(math.Float64bits(s.gain))
 	s.initSoftClipLUT()
-
-	ctx, err := getOtoContext(cfg.SampleRate)
-	if err != nil {
-		return nil, fmt.Errorf("oto context initialization failed: %w", err)
-	}
-	s.otoCtx = ctx
-
-	// The player reads from Synth itself, which implements io.Reader
-	s.player = ctx.NewPlayer(s)
-	s.player.SetBufferSize(8192)
-	s.player.Play()
 
 	return s, nil
 }
@@ -128,43 +88,36 @@ func NewHeadless(cfg config.Audio) (*Synth, error) {
 	s := &Synth{
 		sampleRate: cfg.SampleRate,
 		gain:       0.5,
+		gainTarget: 0.5,
 		isHeadless: true,
 	}
+	s.targetGain.Store(math.Float64bits(s.gain))
 	s.initSoftClipLUT()
 	return s, nil
 }
 
 // initSoftClipLUT populates the soft clipping lookup table.
 // Input range [-1.5, 1.5] maps to LUT indices [0, 4095].
-// Linear region |x| < 1.0 uses x - x^3/3 (tanh approximation).
-// Saturation region uses a soft asymptotic curve.
+// The tanh transfer is continuous, monotonic, symmetric, and finite.
 func (s *Synth) initSoftClipLUT() {
 	for i := 0; i < 4096; i++ {
 		x := float64(i-2048) / 2048.0 * 1.5
-		var v float64
-		if x > 1.0 {
-			t := x - 1.0
-			v = 1.0 - 1.0/(3.0*t*t+1.0)
-		} else if x < -1.0 {
-			t := -x - 1.0
-			v = -(1.0 - 1.0/(3.0*t*t+1.0))
-		} else {
-			v = x - x*x*x/3.0
-		}
-		s.softClipLUT[i] = float32(v)
+		s.softClipLUT[i] = float32(math.Tanh(x))
 	}
 }
 
 // softClip applies soft clipping using the LUT.
 func softClip(lut *[4096]float32, x float32) float32 {
-	idx := int((x/1.5)*2048 + 2048)
-	if idx < 0 {
+	position := (x/1.5)*2048 + 2048
+	idx := int(math.Floor(float64(position)))
+	if idx <= 0 {
 		return lut[0]
 	}
-	if idx >= 4096 {
+	if idx >= 4095 {
 		return lut[4095]
 	}
-	return lut[idx]
+	fraction := position - float32(idx)
+	return lut[idx] + fraction*(lut[idx+1]-lut[idx])
 }
 
 // drainEvents processes all queued MIDI events under the lock.
@@ -173,10 +126,11 @@ func (s *Synth) drainEvents() {
 	if s.evQueue == nil {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.syn == nil {
 		return
+	}
+	if s.emergencyAllNotesOff.Swap(false) {
+		s.syn.NoteOffAll(false)
 	}
 	for {
 		ev, ok := s.evQueue.Read()
@@ -192,89 +146,56 @@ func (s *Synth) drainEvents() {
 			s.syn.ProcessMidiMessage(ev.channel, 0xB0, ev.data1, ev.data2)
 		case evProgramChange:
 			s.syn.ProcessMidiMessage(ev.channel, 0xB0, 0x00, ev.data1) // bank
-			s.syn.ProcessMidiMessage(ev.channel, 0xC0, ev.data2, 0)     // program
+			s.syn.ProcessMidiMessage(ev.channel, 0xC0, ev.data2, 0)    // program
 		case evAllNotesOff:
 			s.syn.NoteOffAll(false)
-		case evSetGain:
-			newGain := math.Float64frombits(uint64(ev.data1))
-			s.gain = newGain
-			s.syn.MasterVolume = float32(newGain)
 		}
 	}
 }
 
-// Read implements io.Reader to feed the ebitengine/oto/v3 audio driver.
-func (s *Synth) Read(p []byte) (n int, err error) {
-	// 1 frame = 2 channels * 4 bytes (32-bit Float LE) = 8 bytes
-	frames := len(p) / 8
-	if frames == 0 {
-		return 0, nil
-	}
-
-	// Check muted flag (set during synth swap)
-	s.mu.Lock()
-	muted := s.muted
-	s.mu.Unlock()
-	if muted {
-		for i := range p {
-			p[i] = 0
-		}
-		return frames * 8, nil
-	}
-
-	// Drain queued events before rendering
+// renderInto is called only by the process audio renderer (or the single
+// offline renderer goroutine). The supplied buffers are reused by the caller.
+func (s *Synth) renderInto(left, right []float32) {
 	s.drainEvents()
-
-	leftBuf := make([]float32, frames)
-	rightBuf := make([]float32, frames)
-
-	s.mu.Lock()
-	syn := s.syn
-	activePlayer := s.activePlayer
-	s.mu.Unlock()
-
-	if syn == nil {
-		for i := range p {
-			p[i] = 0
-		}
-		return frames * 8, nil
+	if s.syn == nil {
+		clear(left)
+		clear(right)
+		return
 	}
 
-	if activePlayer != nil && atomic.LoadInt32(&activePlayer.active) == 1 {
-		activePlayer.sequencer.Render(leftBuf, rightBuf)
+	if s.activePlayer != nil && atomic.LoadInt32(&s.activePlayer.active) == 1 {
+		s.activePlayer.sequencer.Render(left, right)
 	} else {
-		syn.Render(leftBuf, rightBuf)
+		s.syn.Render(left, right)
 	}
 
-	// DC blocker + soft clip + encode to float32 LE
-	for i := 0; i < frames; i++ {
-		xL := leftBuf[i]
+	target := math.Float64frombits(s.targetGain.Load())
+	if target != s.gainTarget {
+		s.gainTarget = target
+		s.gainRemaining = max(s.sampleRate/100, 1) // 10 ms
+		s.gainStep = (target - s.gain) / float64(s.gainRemaining)
+	}
+	for i := range left {
+		if s.gainRemaining > 0 {
+			s.gain += s.gainStep
+			s.gainRemaining--
+			if s.gainRemaining == 0 {
+				s.gain = s.gainTarget
+			}
+		}
+		xL := left[i]
 		yL := xL - s.dcLeftX + 0.999*s.dcLeftY
 		s.dcLeftX = xL
 		s.dcLeftY = yL
 
-		xR := rightBuf[i]
+		xR := right[i]
 		yR := xR - s.dcRightX + 0.999*s.dcRightY
 		s.dcRightX = xR
 		s.dcRightY = yR
 
-		lVal := softClip(&s.softClipLUT, yL)
-		rVal := softClip(&s.softClipLUT, yR)
-
-		lBits := math.Float32bits(lVal)
-		rBits := math.Float32bits(rVal)
-
-		p[i*8] = byte(lBits)
-		p[i*8+1] = byte(lBits >> 8)
-		p[i*8+2] = byte(lBits >> 16)
-		p[i*8+3] = byte(lBits >> 24)
-		p[i*8+4] = byte(rBits)
-		p[i*8+5] = byte(rBits >> 8)
-		p[i*8+6] = byte(rBits >> 16)
-		p[i*8+7] = byte(rBits >> 24)
+		left[i] = softClip(&s.softClipLUT, yL*float32(s.gain))
+		right[i] = softClip(&s.softClipLUT, yR*float32(s.gain))
 	}
-
-	return frames * 8, nil
 }
 
 // LoadSoundFont loads a .sf2 file into the synth.
@@ -302,7 +223,7 @@ func (s *Synth) LoadSoundFont(path string) error {
 	}
 
 	s.syn = syn
-	s.syn.MasterVolume = float32(s.gain)
+	s.syn.MasterVolume = 1
 
 	return nil
 }
@@ -310,12 +231,13 @@ func (s *Synth) LoadSoundFont(path string) error {
 // ProgramChange selects a bank and program on a channel.
 func (s *Synth) ProgramChange(channel, bank, program int) {
 	if s.evQueue != nil {
-		s.evQueue.Write(synthEvent{
+		ev := synthEvent{
 			kind:    evProgramChange,
 			channel: int32(channel),
 			data1:   int32(bank),
 			data2:   int32(program),
-		})
+		}
+		s.enqueue(ev, false)
 		return
 	}
 	// Headless fallback
@@ -328,15 +250,22 @@ func (s *Synth) ProgramChange(channel, bank, program int) {
 	s.syn.ProcessMidiMessage(int32(channel), 0xC0, int32(program), 0)
 }
 
+// prepareProgram configures an unpublished synth without queueing the command.
+func (s *Synth) prepareProgram(channel, bank, program int) {
+	s.syn.ProcessMidiMessage(int32(channel), 0xB0, 0x00, int32(bank))
+	s.syn.ProcessMidiMessage(int32(channel), 0xC0, int32(program), 0)
+}
+
 // NoteOn sends a note-on message.
 func (s *Synth) NoteOn(channel, key, velocity int) {
 	if s.evQueue != nil {
-		s.evQueue.Write(synthEvent{
+		ev := synthEvent{
 			kind:    evNoteOn,
 			channel: int32(channel),
 			data1:   int32(key),
 			data2:   int32(velocity),
-		})
+		}
+		s.enqueue(ev, false)
 		return
 	}
 	// Headless fallback
@@ -351,11 +280,12 @@ func (s *Synth) NoteOn(channel, key, velocity int) {
 // NoteOff sends a note-off message.
 func (s *Synth) NoteOff(channel, key int) {
 	if s.evQueue != nil {
-		s.evQueue.Write(synthEvent{
+		ev := synthEvent{
 			kind:    evNoteOff,
 			channel: int32(channel),
 			data1:   int32(key),
-		})
+		}
+		s.enqueue(ev, true)
 		return
 	}
 	// Headless fallback
@@ -370,12 +300,13 @@ func (s *Synth) NoteOff(channel, key int) {
 // CC sends a control change message.
 func (s *Synth) CC(channel, cc, value int) {
 	if s.evQueue != nil {
-		s.evQueue.Write(synthEvent{
+		ev := synthEvent{
 			kind:    evCC,
 			channel: int32(channel),
 			data1:   int32(cc),
 			data2:   int32(value),
-		})
+		}
+		s.enqueue(ev, false)
 		return
 	}
 	// Headless fallback
@@ -389,33 +320,27 @@ func (s *Synth) CC(channel, cc, value int) {
 
 // SetGain sets the master gain (volume) of the synth. Range: 0.0 to 1.0 (recommended).
 func (s *Synth) SetGain(gain float64) {
-	if s.evQueue != nil {
-		s.evQueue.Write(synthEvent{
-			kind:  evSetGain,
-			data1: int32(math.Float64bits(gain)),
-		})
-		return
-	}
-	// Headless fallback
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.targetGain.Store(math.Float64bits(gain))
+}
+
+// prepareGain configures an unpublished synth without creating a startup ramp.
+func (s *Synth) prepareGain(gain float64) {
 	s.gain = gain
-	if s.syn != nil {
-		s.syn.MasterVolume = float32(gain)
-	}
+	s.gainTarget = gain
+	s.gainStep = 0
+	s.gainRemaining = 0
+	s.targetGain.Store(math.Float64bits(gain))
 }
 
 // Gain returns the current master gain.
 func (s *Synth) Gain() float64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.gain
+	return math.Float64frombits(s.targetGain.Load())
 }
 
 // AllNotesOff sends All Notes Off on all channels.
 func (s *Synth) AllNotesOff() {
 	if s.evQueue != nil {
-		s.evQueue.Write(synthEvent{kind: evAllNotesOff})
+		s.enqueue(synthEvent{kind: evAllNotesOff}, true)
 		return
 	}
 	// Headless fallback
@@ -427,31 +352,11 @@ func (s *Synth) AllNotesOff() {
 	s.syn.NoteOffAll(false)
 }
 
-// DrainAndMute drains the event queue and mutes audio output.
-// Used during synth swap to prevent overlapping audio from the old synth.
-func (s *Synth) DrainAndMute() {
-	// Drain any pending NoteOff events to ensure clean silence
-	s.drainEvents()
-	s.mu.Lock()
-	s.muted = true
-	s.mu.Unlock()
-}
-
 // Close releases resources.
-func (s *Synth) Close() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.player != nil {
-		s.player.Close()
-		s.player = nil
-	}
-}
+func (s *Synth) Close() {}
 
 // WriteS16 renders PCM samples for offline rendering.
 func (s *Synth) WriteS16(buf []int16) error {
-	// Drain queued events (headless mode: queue is nil, no-op)
-	s.drainEvents()
-
 	frames := len(buf) / 2
 	if frames == 0 {
 		return nil
@@ -460,38 +365,11 @@ func (s *Synth) WriteS16(buf []int16) error {
 	leftBuf := make([]float32, frames)
 	rightBuf := make([]float32, frames)
 
-	s.mu.Lock()
-	syn := s.syn
-	activePlayer := s.activePlayer
-	s.mu.Unlock()
-
-	if syn == nil {
-		for i := range buf {
-			buf[i] = 0
-		}
-		return nil
-	}
-
-	if activePlayer != nil && atomic.LoadInt32(&activePlayer.active) == 1 {
-		activePlayer.sequencer.Render(leftBuf, rightBuf)
-	} else {
-		syn.Render(leftBuf, rightBuf)
-	}
+	s.renderInto(leftBuf, rightBuf)
 
 	for i := 0; i < frames; i++ {
-		// DC Blocker filter (R = 0.999)
-		xL := leftBuf[i]
-		yL := xL - s.dcLeftX + 0.999*s.dcLeftY
-		s.dcLeftX = xL
-		s.dcLeftY = yL
-
-		xR := rightBuf[i]
-		yR := xR - s.dcRightX + 0.999*s.dcRightY
-		s.dcRightX = xR
-		s.dcRightY = yR
-
-		lVal := softClip(&s.softClipLUT, yL)
-		rVal := softClip(&s.softClipLUT, yR)
+		lVal := leftBuf[i]
+		rVal := rightBuf[i]
 
 		var lInt, rInt int16
 		if lVal >= 0 {
@@ -586,5 +464,43 @@ func (s *Synth) logDroppedEvent(ev synthEvent) {
 			ev.channel, ev.data1)
 	default:
 		log.Printf("warning: synth event queue full, event kind=%d dropped", ev.kind)
+	}
+}
+
+func (s *Synth) enqueue(ev synthEvent, critical bool) bool {
+	if s.evQueue.Write(ev) {
+		depth := uint64(s.evQueue.Len())
+		for maximum := s.queueHighWater.Load(); depth > maximum; maximum = s.queueHighWater.Load() {
+			if s.queueHighWater.CompareAndSwap(maximum, depth) {
+				break
+			}
+		}
+		return true
+	}
+	s.queueDropped.Add(1)
+	if critical {
+		s.emergencyAllNotesOff.Store(true)
+	}
+	s.logDroppedEvent(ev)
+	return false
+}
+
+// QueueMetrics reports realtime synth command queue pressure.
+type QueueMetrics struct {
+	Depth     int    `json:"depth"`
+	Capacity  int    `json:"capacity"`
+	HighWater uint64 `json:"high_water"`
+	Dropped   uint64 `json:"dropped"`
+}
+
+func (s *Synth) QueueMetrics() QueueMetrics {
+	if s == nil || s.evQueue == nil {
+		return QueueMetrics{}
+	}
+	return QueueMetrics{
+		Depth:     s.evQueue.Len(),
+		Capacity:  s.evQueue.Cap(),
+		HighWater: s.queueHighWater.Load(),
+		Dropped:   s.queueDropped.Load(),
 	}
 }
